@@ -6,6 +6,7 @@
 #include "trax-kernel/include.hpp"
 #include "trax-kernel/intersect.hpp"
 #include "units/unit-texture.hpp"
+#include "util/live-stream.hpp"
 
 namespace Arches {
 
@@ -492,6 +493,23 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	std::vector<std::vector<Units::UnitBase*>> unit_tables; unit_tables.reserve(num_tms);
 	std::vector<std::vector<Units::UnitSFU*>> sfu_lists; sfu_lists.reserve(num_tms);
 	std::vector<std::vector<Units::UnitMemoryBase*>> mem_lists; mem_lists.reserve(num_tms);
+	//architecture description for the live visualizer's block diagram; each group is recorded where it is built
+	Topology topology;
+	auto num = [](auto v) { return std::to_string(v); };
+	auto cache_props = [&](const UnitL1Cache::Configuration& config) -> Topology::Props
+	{
+		return {
+			{"size", Topology::bytes(config.size)},
+			{"associativity", num(config.associativity) + "-way"},
+			{"block", Topology::bytes(config.block_size)},
+			{"slices x banks", num(config.num_slices) + " x " + num(config.num_banks)},
+			{"MSHRs x subentries", num(config.num_mshr) + " x " + num(config.num_subentries)},
+			{"latency", num(config.latency) + " cycles"},
+			{"policy", config.policy == Units::UnitCacheBase::Policy::LRU ? "LRU" : "FIFO"},
+			{"miss allocate", config.miss_alloc ? "yes" : "no"},
+			{"block prefetch", config.block_prefetch ? "yes" : "no"},
+		};
+	};
 
 	//construct memory partitions
 	std::vector<UnitDRAM*> drams;
@@ -511,11 +529,26 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 		xbar_config.mem_highers.push_back(l2s.back());
 	}
+	topology.group("dram", "DRAM", (uint)drams.size(), {
+		{"config", dram_config.config_path.substr(dram_config.config_path.find_last_of("/\\") + 1)},
+		{"clock", num((uint)(dram_clock / 1e6)) + " MHz"},
+		{"capacity", Topology::bytes(dram_config.size)},
+		{"latency", num(dram_config.latency) + " cycles"},
+	}, "", "dram");
+	topology.group("l2", "L2$", (uint)l2s.size(), cache_props(l2_config), "", "l2");
+	topology.link("l2", "dram", "one", "dram");
 
 	xbar_config.num_clients = num_tms;
 	Units::UnitCrossbar xbar(xbar_config);
 	simulator.register_unit(&xbar);
 	simulator.new_unit_group();
+	topology.group("xbar", "Crossbar", 1, {
+		{"clients", num(xbar_config.num_clients)},
+		{"partitions", num(xbar_config.num_partitions)},
+		{"slices per partition", num(xbar_config.num_slices)},
+		{"partition stride", Topology::bytes(xbar_config.partition_stride)},
+	});
+	topology.link("xbar", "l2", "all", "l2");
 
 	std::vector<uint8_t> vec_mem;
 	vec_mem.resize(256 << 20);
@@ -547,6 +580,7 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	Units::UnitAtomicRegfile atomic_regs(num_tms);
 	simulator.register_unit(&atomic_regs);
 	simulator.new_unit_group();
+	topology.group("atomic", "Atomic registers", 1, {{"clients", num(num_tms)}, {"use", "thread fetch counter"}});
 
 	l1d_config.num_ports = num_tps;
 	l1d_config.mem_highers = {&xbar};
@@ -652,6 +686,43 @@ static void run_sim_trax(SimulationConfig& sim_config)
 		simulator.new_unit_group();
 	}
 
+	{
+		auto& instr_names = ISA::RISCV::InstructionTypeNameDatabase::get_instance();
+		auto served_by = [&](const Units::UnitBase* unit)
+		{
+			std::string types;
+			for(uint t = 0; t < (uint)ISA::RISCV::InstrType::NUM_TYPES; ++t)
+				if(unit_tables[0][t] == unit)
+					types += (types.empty() ? "" : ", ") + instr_names[(ISA::RISCV::InstrType)t];
+			return types;
+		};
+
+		topology.group("tm", "TM", num_tms, {{"TPs", num(num_tps)}, {"threads per TP", num(num_threads)}});
+		topology.group("tp", "TP", (uint)tps.size(), {{"threads", num(num_threads)}, {"stack", Topology::bytes(stack_size)}}, "tm", "tp");
+		topology.group("sched", "Thread scheduler", (uint)thread_schedulers.size(), {{"serves", served_by(thread_schedulers[0])}}, "tm");
+		Topology::Props sfu_props;
+		for(uint i = 0; i < sfu_lists[0].size(); ++i)
+			sfu_props.push_back({"SFU " + num(i), served_by(sfu_lists[0][i])});
+		topology.group("sfu", "SFUs", (uint)sfus.size(), sfu_props, "tm");
+		topology.group("tu", "Texture unit", (uint)tus.size(), {{"serves", served_by(tus[0])}}, "tm");
+		if(!rtcs.empty())
+			topology.group("rtc", "RT core", (uint)rtcs.size(), {{"serves", served_by(rtcs[0])}, {"max rays", num(rtc_config.max_rays)}, {"cache ports", num(rtc_config.num_cache_ports)}}, "tm", "rtc");
+		topology.group("l1d", "L1d$", (uint)l1ds.size(), cache_props(l1d_config), "tm", "l1d");
+
+		topology.link("tp", "sched", "local");
+		topology.link("tp", "sfu", "local");
+		topology.link("tp", "tu", "local");
+		if(!rtcs.empty())
+		{
+			topology.link("tp", "rtc", "local");
+			topology.link("rtc", "l1d", "local");
+		}
+		topology.link("tp", "l1d", "local", "l1d");
+		topology.link("tu", "l1d", "local");
+		topology.link("sched", "atomic", "all");
+		topology.link("l1d", "xbar", "all", "l2");
+	}
+
 	printf("Starting TRaX\n");
 	for(auto& tp : tps)
 		tp->set_entry_point(elf.elf_header->e_entry.u64);
@@ -673,12 +744,211 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	float peak_l2_bandwidth = num_partitions * l2_config.num_slices * MemoryRequest::MAX_SIZE;
 	float peak_l1d_bandwidth = num_tms * l1d_config.num_banks * MemoryRequest::MAX_SIZE;
 
+	//live stream to an external visualizer
+	LiveStream live_stream(sim_config.get_string("live-host"), (uint16_t)sim_config.get_int("live-port"));
+	uint live_frame_interval = sim_config.get_int("live-frame-interval");
+	bool print_intervals = sim_config.get_int("print-intervals") != 0;
+	uint live_interval_index = 0;
+	constexpr uint num_instr_types = (uint)ISA::RISCV::InstrType::NUM_TYPES;
+	uint64_t live_tp_prev[3][num_instr_types] = {};
+	std::vector<uint64_t> live_tp_issued_prev(tps.size(), 0);
+
+	std::vector<uint8_t> live_framebuffer;
+	auto read_framebuffer = [&]() -> const uint8_t*
+	{
+		paddr_t fb_start = (paddr_t)kernel_args.framebuffer;
+		paddr_t fb_end = fb_start + (paddr_t)kernel_args.framebuffer_size * sizeof(uint32_t);
+		paddr_t start = fb_start / partition_stride * partition_stride;
+		live_framebuffer.resize(fb_end - start + partition_stride);
+		for(paddr_t addr = start; addr < fb_end; addr += partition_stride)
+			drams[xbar.get_partition(addr)]->direct_read(live_framebuffer.data() + (addr - start), partition_stride, xbar.strip_partition_bits(addr));
+		return live_framebuffer.data() + (fb_start - start);
+	};
+
+	auto write_cache_log = [](JsonWriter& json, const char* key, const UnitL1Cache::Log& log)
+	{
+		json.begin_object(key)
+			.value("hits", log.hits)
+			.value("misses", log.misses)
+			.value("half_misses", log.half_misses)
+			.value("uncached_requests", log.uncached_requests)
+			.value("mshr_stalls", log.mshr_stalls)
+			.value("bytes_read", log.bytes_read)
+			.value("tag_array_access", log.tag_array_access)
+			.value("data_array_reads", log.data_array_reads)
+			.value("data_array_writes", log.data_array_writes)
+			.end_object();
+	};
+
+	auto write_cache_config = [](JsonWriter& json, const char* key, const UnitL1Cache::Configuration& config, uint num_units, float peak_bandwidth)
+	{
+		json.begin_object(key)
+			.value("units", num_units)
+			.value("size", config.size)
+			.value("associativity", config.associativity)
+			.value("slices", config.num_slices)
+			.value("banks", config.num_banks)
+			.value("mshrs", config.num_mshr)
+			.value("latency", config.latency)
+			.value("peak_bytes_per_cycle", (double)peak_bandwidth)
+			.end_object();
+	};
+
+	if(live_stream.connected())
+	{
+		JsonWriter json;
+		json.begin_object()
+			.value("version", 1u)
+			.value("arch", sim_config.get_string("arch-name"))
+			.value("scene", sim_config.get_string("scene-name"))
+			.value("core_clock_hz", core_clock)
+			.value("dram_clock_hz", dram_clock)
+			.value("logging_interval", delta)
+			.value("num_tms", num_tms)
+			.value("num_tps", num_tps)
+			.value("num_threads", num_threads)
+			.value("num_partitions", num_partitions)
+			.value("framebuffer_width", kernel_args.framebuffer_width)
+			.value("framebuffer_height", kernel_args.framebuffer_height)
+			.value("has_rt_core", (uint)!rtcs.empty())
+			.value("tms_per_l2", (uint)(num_tms / l2s.size()))
+			.raw("topology", topology.json())
+			.begin_object("dram")
+				.value("units", (uint)drams.size())
+				.value("peak_bytes_per_cycle", (double)peak_dram_bandwidth)
+			.end_object();
+		write_cache_config(json, "l2", l2_config, (uint)l2s.size(), peak_l2_bandwidth);
+		write_cache_config(json, "l1d", l1d_config, (uint)l1ds.size(), peak_l1d_bandwidth);
+		json.begin_array("instr_types");
+		for(uint i = 0; i < num_instr_types; ++i)
+			json.value(nullptr, ISA::RISCV::InstructionTypeNameDatabase::get_instance()[(ISA::RISCV::InstrType)i]);
+		json.end_array().end_object();
+		live_stream.send(LiveStream::MessageType::HELLO, json.str());
+	}
+
 	//peak_dram_bandwidth = 32 * core_clock * num_partitions;
 	//peak_l2_bandwidth = 32 * num_tms / 2;
+
+	//per-unit counters for the visualizer's heatmaps; must run before delta_log resets the unit logs
+	auto snapshot_units = [&]() -> std::string
+	{
+		auto write_caches = [](JsonWriter& json, const char* key, const std::vector<UnitL1Cache*>& caches)
+		{
+			std::vector<uint64_t> hits, half_misses, misses, mshr_stalls, bytes_read;
+			for(auto& cache : caches)
+			{
+				hits.push_back(cache->log.hits);
+				half_misses.push_back(cache->log.half_misses);
+				misses.push_back(cache->log.misses);
+				mshr_stalls.push_back(cache->log.mshr_stalls);
+				bytes_read.push_back(cache->log.bytes_read);
+			}
+			json.begin_object(key)
+				.counters("hits", hits)
+				.counters("half_misses", half_misses)
+				.counters("misses", misses)
+				.counters("mshr_stalls", mshr_stalls)
+				.counters("bytes_read", bytes_read)
+				.end_object();
+		};
+
+		JsonWriter json;
+		json.begin_object();
+		write_caches(json, "l1d", l1ds);
+		write_caches(json, "l2", l2s);
+
+		std::vector<uint64_t> dram_bytes_read, dram_loads, dram_stores, rays;
+		for(auto& dram : drams)
+		{
+			dram_bytes_read.push_back(dram->log.bytes_read);
+			dram_loads.push_back(dram->log.loads);
+			dram_stores.push_back(dram->log.stores);
+		}
+		for(auto& rtc : rtcs)
+			rays.push_back(rtc->log.rays);
+
+		json.begin_object("dram")
+				.counters("bytes_read", dram_bytes_read)
+				.counters("loads", dram_loads)
+				.counters("stores", dram_stores)
+			.end_object()
+			.begin_object("rtc")
+				.counters("rays", rays)
+			.end_object()
+			.end_object();
+		return json.str();
+	};
+
+	auto send_live_stats = [&](uint cycles, double wall_time, const std::string& units_json, const UnitDRAM::Log& dram_delta_log, const UnitL2Cache::Log& l2_delta_log,
+		const UnitL1Cache::Log& l1d_delta_log, const Units::UnitTexture::Log& tu_delta_log, const UnitRTCore::Log& rtc_delta_log)
+	{
+		//TP logs are not reset per interval (the final report and profile rely on them), so diff running totals instead
+		uint64_t tp_totals[3][num_instr_types] = {};
+		std::vector<uint64_t> tp_issued(tps.size());
+		for(uint t = 0; t < tps.size(); ++t)
+		{
+			uint64_t issued = 0;
+			for(uint i = 0; i < num_instr_types; ++i)
+			{
+				tp_totals[0][i] += tps[t]->log.instruction_counters[i];
+				tp_totals[1][i] += tps[t]->log._resource_stall_counters[i];
+				tp_totals[2][i] += tps[t]->log._data_stall_counters[i];
+				issued += tps[t]->log.instruction_counters[i];
+			}
+			tp_issued[t] = issued - live_tp_issued_prev[t];
+			live_tp_issued_prev[t] = issued;
+		}
+		uint64_t tp_delta[3][num_instr_types];
+		for(uint j = 0; j < 3; ++j)
+			for(uint i = 0; i < num_instr_types; ++i)
+			{
+				tp_delta[j][i] = tp_totals[j][i] - live_tp_prev[j][i];
+				live_tp_prev[j][i] = tp_totals[j][i];
+			}
+
+		JsonWriter json;
+		json.begin_object()
+			.value("cycle", (int64_t)simulator.current_cycle)
+			.value("cycles", cycles)
+			.value("wall_time_s", wall_time)
+			.value("threads_launched", (uint64_t)atomic_regs.iregs[0])
+			.begin_object("dram")
+				.value("loads", dram_delta_log.loads)
+				.value("stores", dram_delta_log.stores)
+				.value("bytes_read", dram_delta_log.bytes_read)
+				.value("bytes_written", dram_delta_log.bytes_written)
+				.value("unique_loads", dram_delta_log.unique_loads)
+				.value("unique_rows", dram_delta_log.unique_rows)
+			.end_object();
+		write_cache_log(json, "l2", l2_delta_log);
+		write_cache_log(json, "l1d", l1d_delta_log);
+		json.begin_object("tu")
+				.value("texels", tu_delta_log.texels)
+				.value("loads", tu_delta_log.loads)
+			.end_object()
+			.begin_object("rtc")
+				.value("rays", rtc_delta_log.rays)
+				.value("nodes", rtc_delta_log.nodes)
+				.value("strips", rtc_delta_log.strips)
+				.value("tris", rtc_delta_log.tris)
+				.value("restarts", rtc_delta_log.restarts)
+				.value("hits_returned", rtc_delta_log.hits_returned)
+			.end_object()
+			.begin_object("tp")
+				.counters("issued", tp_delta[0], num_instr_types)
+				.counters("resource_stalls", tp_delta[1], num_instr_types)
+				.counters("data_stalls", tp_delta[2], num_instr_types)
+				.counters("issued_per_tp", tp_issued) //TM-major: index = tm * num_tps + tp
+			.end_object()
+			.raw("units", units_json)
+			.end_object();
+		live_stream.send(LiveStream::MessageType::STATS, json.str());
+	};
 
 	auto start = std::chrono::high_resolution_clock::now();
 	simulator.execute(delta, [&]() -> void
 	{
+		std::string units_json = live_stream.connected() ? snapshot_units() : std::string();
 		UnitDRAM::Log dram_delta_log = delta_log(dram_log, drams);
 		UnitL2Cache::Log l2_delta_log = delta_log(l2_log, l2s);
 		UnitL1Cache::Log l1d_delta_log = delta_log(l1d_log, l1ds);
@@ -687,35 +957,60 @@ static void run_sim_trax(SimulationConfig& sim_config)
 
 		double simulation_time = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - start).count() / 1000.0;
 
-		printf("                            \n");
-		printf("Cycle: %lld                 \n", simulator.current_cycle);
-		printf("Threads Launched: %d        \n", atomic_regs.iregs[0]);
-		printf("Simulation rate: %.2f KHz\n", simulator.current_cycle / simulation_time / 1000.0);
-		printf("                            \n");
-		printf("DRAM Read: %8.1f GB/s  (%.2f%%)\n", (float)dram_delta_log.bytes_read / delta_ns, 100.0f * dram_delta_log.bytes_read / delta / peak_dram_bandwidth);
-		printf(" L2$ Read: %8.1f B/clk (%.2f%%)\n", (float)l2_delta_log.bytes_read / delta, 100.0f * l2_delta_log.bytes_read / delta / peak_l2_bandwidth);
-		printf("L1d$ Read: %8.1f B/clk (%.2f%%)\n", (float)l1d_delta_log.bytes_read / delta, 100.0 * l1d_delta_log.bytes_read / delta / peak_l1d_bandwidth);
-		printf("                            \n");
-		printf(" L2$ Hit/Half/Miss: %3.1f%%/%3.1f%%/%3.1f%%\n", 100.0 * l2_delta_log.hits / l2_delta_log.get_total(), 100.0 * l2_delta_log.half_misses / l2_delta_log.get_total(), 100.0 * l2_delta_log.misses / l2_delta_log.get_total());
-		printf("L1d$ Hit/Half/Miss: %3.1f%%/%3.1f%%/%3.1f%%\n", 100.0 * l1d_delta_log.hits / l1d_delta_log.get_total(), 100.0 * l1d_delta_log.half_misses / l1d_delta_log.get_total(), 100.0 * l1d_delta_log.misses / l1d_delta_log.get_total());
-		printf("                            \n");
-		printf(" L2$ Stalls: %0.2f%%\n", 100.0 * l2_delta_log.mshr_stalls / num_partitions / l2_config.num_slices / l2_config.num_banks / delta);
-		printf("L1d$ Stalls: %0.2f%%\n", 100.0 * l1d_delta_log.mshr_stalls / num_tms / l1d_config.num_banks / delta);
-		printf("                            \n");
-		printf("L2$  Occ: %0.2f%%\n", 100.0 * l2_delta_log.get_total() / num_partitions / l2_config.num_slices / l2_config.num_banks / delta);
-		printf("L1d$ Occ: %0.2f%%\n", 100.0 * l1d_delta_log.get_total() / num_tms / l1d_config.num_banks / delta);
-		printf("                            \n");
-		
-		tu_delta_log.print(delta, tus.size());
-		
-		if(!rtcs.empty())
+		if(print_intervals)
 		{
-			printf("MRays/s: %.0f\n\n", rtc_delta_log.rays / delta_ns * 1000.0);
-			rtc_delta_log.print(rtcs.size());
+			printf("                            \n");
+			printf("Cycle: %lld                 \n", simulator.current_cycle);
+			printf("Threads Launched: %d        \n", atomic_regs.iregs[0]);
+			printf("Simulation rate: %.2f KHz\n", simulator.current_cycle / simulation_time / 1000.0);
+			printf("                            \n");
+			printf("DRAM Read: %8.1f GB/s  (%.2f%%)\n", (float)dram_delta_log.bytes_read / delta_ns, 100.0f * dram_delta_log.bytes_read / delta / peak_dram_bandwidth);
+			printf(" L2$ Read: %8.1f B/clk (%.2f%%)\n", (float)l2_delta_log.bytes_read / delta, 100.0f * l2_delta_log.bytes_read / delta / peak_l2_bandwidth);
+			printf("L1d$ Read: %8.1f B/clk (%.2f%%)\n", (float)l1d_delta_log.bytes_read / delta, 100.0 * l1d_delta_log.bytes_read / delta / peak_l1d_bandwidth);
+			printf("                            \n");
+			printf(" L2$ Hit/Half/Miss: %3.1f%%/%3.1f%%/%3.1f%%\n", 100.0 * l2_delta_log.hits / l2_delta_log.get_total(), 100.0 * l2_delta_log.half_misses / l2_delta_log.get_total(), 100.0 * l2_delta_log.misses / l2_delta_log.get_total());
+			printf("L1d$ Hit/Half/Miss: %3.1f%%/%3.1f%%/%3.1f%%\n", 100.0 * l1d_delta_log.hits / l1d_delta_log.get_total(), 100.0 * l1d_delta_log.half_misses / l1d_delta_log.get_total(), 100.0 * l1d_delta_log.misses / l1d_delta_log.get_total());
+			printf("                            \n");
+			printf(" L2$ Stalls: %0.2f%%\n", 100.0 * l2_delta_log.mshr_stalls / num_partitions / l2_config.num_slices / l2_config.num_banks / delta);
+			printf("L1d$ Stalls: %0.2f%%\n", 100.0 * l1d_delta_log.mshr_stalls / num_tms / l1d_config.num_banks / delta);
+			printf("                            \n");
+			printf("L2$  Occ: %0.2f%%\n", 100.0 * l2_delta_log.get_total() / num_partitions / l2_config.num_slices / l2_config.num_banks / delta);
+			printf("L1d$ Occ: %0.2f%%\n", 100.0 * l1d_delta_log.get_total() / num_tms / l1d_config.num_banks / delta);
+			printf("                            \n");
+
+			tu_delta_log.print(delta, tus.size());
+
+			if(!rtcs.empty())
+			{
+				printf("MRays/s: %.0f\n\n", rtc_delta_log.rays / delta_ns * 1000.0);
+				rtc_delta_log.print(rtcs.size());
+			}
+		}
+
+		if(live_stream.connected())
+		{
+			send_live_stats(delta, simulation_time, units_json, dram_delta_log, l2_delta_log, l1d_delta_log, tu_delta_log, rtc_delta_log);
+
+			++live_interval_index;
+			if(live_frame_interval != 0 && live_interval_index % live_frame_interval == 0)
+				live_stream.send_frame(simulator.current_cycle, kernel_args.framebuffer_width, kernel_args.framebuffer_height, read_framebuffer());
 		}
 	});
 
 	auto stop = std::chrono::high_resolution_clock::now();
+	//send the final partial interval so the streamed intervals sum to the end-of-run totals
+	uint tail_cycles = delta ? (uint)(simulator.current_cycle % delta) : 0;
+	if(live_stream.connected() && tail_cycles != 0)
+	{
+		std::string units_json = snapshot_units();
+		UnitDRAM::Log dram_delta_log = delta_log(dram_log, drams);
+		UnitL2Cache::Log l2_delta_log = delta_log(l2_log, l2s);
+		UnitL1Cache::Log l1d_delta_log = delta_log(l1d_log, l1ds);
+		UnitRTCore::Log rtc_delta_log = delta_log(rtc_log, rtcs);
+		Units::UnitTexture::Log tu_delta_log = delta_log(tu_log, tus);
+		double wall_time = std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count() / 1000.0;
+		send_live_stats(tail_cycles, wall_time, units_json, dram_delta_log, l2_delta_log, l1d_delta_log, tu_delta_log, rtc_delta_log);
+	}
 
 	for(uint addr = 0; addr < (256 << 20); addr += partition_stride)
 		drams[xbar.get_partition(addr)]->direct_read(vec_mem.data() + addr, partition_stride, xbar.strip_partition_bits(addr));
@@ -788,6 +1083,22 @@ static void run_sim_trax(SimulationConfig& sim_config)
 	printf("Simulation rate: %.2f KHz\n", simulator.current_cycle / simulation_time / 1000.0);
 	printf("Simulation time: %.0f s\n", simulation_time);
 	printf("MSIPS: %.2f\n", simulator.current_cycle * tps.size() / simulation_time / 1'000'000.0);
+	if(live_stream.connected())
+	{
+		live_stream.send_frame(simulator.current_cycle, kernel_args.framebuffer_width, kernel_args.framebuffer_height, vec_mem.data() + (size_t)kernel_args.framebuffer);
+
+		JsonWriter json;
+		json.begin_object()
+			.value("cycles", (int64_t)frame_cycles)
+			.value("frame_time_s", frame_time)
+			.value("wall_time_s", simulation_time)
+			.value("power_w", (double)total_power)
+			.value("energy_j", (double)total_energy)
+			.value("rays", rtcs.empty() ? (uint64_t)kernel_args.framebuffer_size : rtc_log.rays)
+			.end_object();
+		live_stream.send(LiveStream::MessageType::DONE, json.str());
+		live_stream.finish();
+	}
 
 	stbi_flip_vertically_on_write(true);
 	stbi_write_png("arches-out.png", (int)kernel_args.framebuffer_width, (int)kernel_args.framebuffer_height, 4, vec_mem.data() + (size_t)kernel_args.framebuffer, 0);
@@ -807,6 +1118,10 @@ int main(int argc, char* argv[])
 	Arches::SimulationConfig sim_config;
 	sim_config.set_param("config-dir", Arches::get_default_config_dir());
 	sim_config.set_param("kernel-path", Arches::get_default_kernel_path());
+	sim_config.set_param("print-intervals", 1);
+	sim_config.set_param("live-host", "127.0.0.1");
+	sim_config.set_param("live-port", 7878);
+	sim_config.set_param("live-frame-interval", 10);
 	sim_config.parse(argc, argv);
 
 	Arches::TRaX::run_sim_trax(sim_config);
